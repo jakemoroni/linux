@@ -3590,6 +3590,36 @@ error:
 	return ERR_PTR(err);
 }
 
+static int irdma_hwdereg_mr(struct ib_mr *ib_mr);
+
+static void irdma_umem_dmabuf_revoke(void *priv)
+{
+	/* priv is guaranteed to be valid any time this callback is invoked
+	 * because we do not set the callback until after successful iwmr
+	 * allocation and initialization.
+	 */
+	struct irdma_mr *iwmr = priv;
+	int err;
+
+	/* Invalidate the key in hardware. This does not actually release the
+	 * key for potential reuse - that only occurs when the region is fully
+	 * deregistered.
+	 *
+	 * The irdma_hwdereg_mr call is a no-op if the region is not currently
+	 * registered with hardware.
+	 */
+	err = irdma_hwdereg_mr(&iwmr->ibmr);
+	if (err) {
+		struct irdma_device *iwdev = to_iwdev(iwmr->ibmr.device);
+
+		ibdev_err(&iwdev->ibdev, "dmabuf mr revoke failed %d", err);
+		if (!iwdev->rf->reset) {
+			iwdev->rf->reset = true;
+			iwdev->rf->gen_ops.request_reset(iwdev->rf);
+		}
+	}
+}
+
 static struct ib_mr *irdma_reg_user_mr_dmabuf(struct ib_pd *pd, u64 start,
 					      u64 len, u64 virt,
 					      int fd, int access,
@@ -3607,7 +3637,9 @@ static struct ib_mr *irdma_reg_user_mr_dmabuf(struct ib_pd *pd, u64 start,
 	if (len > iwdev->rf->sc_dev.hw_attrs.max_mr_size)
 		return ERR_PTR(-EINVAL);
 
-	umem_dmabuf = ib_umem_dmabuf_get_pinned(pd->device, start, len, fd, access);
+	umem_dmabuf =
+		ib_umem_dmabuf_get_pinned_revocable_and_lock(pd->device, start,
+							     len, fd, access);
 	if (IS_ERR(umem_dmabuf)) {
 		ibdev_dbg(&iwdev->ibdev, "Failed to get dmabuf umem[%pe]\n",
 			  umem_dmabuf);
@@ -3624,12 +3656,20 @@ static struct ib_mr *irdma_reg_user_mr_dmabuf(struct ib_pd *pd, u64 start,
 	if (err)
 		goto err_iwmr;
 
+	ib_umem_dmabuf_set_revoke_locked(umem_dmabuf, irdma_umem_dmabuf_revoke,
+					 iwmr);
+	dma_resv_unlock(umem_dmabuf->attach->dmabuf->resv);
 	return &iwmr->ibmr;
 
 err_iwmr:
 	irdma_free_iwmr(iwmr);
 
 err_release:
+	dma_resv_unlock(umem_dmabuf->attach->dmabuf->resv);
+
+	/* Will result in a call to revoke, but driver callback is not set and
+	 * is therefore skipped.
+	 */
 	ib_umem_release(&umem_dmabuf->umem);
 
 	return ERR_PTR(err);
@@ -3900,6 +3940,32 @@ static void irdma_del_memlist(struct irdma_mr *iwmr,
 }
 
 /**
+ * irdma_dereg_mr_dmabuf - deregister a dmabuf mr
+ * @iwdev: iwarp device
+ * @iwmr: mr
+ *
+ * dmabuf deregistration requires a slightly different sequence since it relies
+ * on the umem release to invalidate the region in hardware via the revoke
+ * callback. This ensures serialization w.r.t. concurrent revocations.
+ */
+static int irdma_dereg_mr_dmabuf(struct irdma_device *iwdev,
+				 struct irdma_mr *iwmr)
+{
+	struct irdma_pbl *iwpbl = &iwmr->iwpbl;
+
+	/* Triggers a synchronous call to the revoke callback. */
+	ib_umem_release(iwmr->region);
+
+	irdma_free_stag(iwdev, iwmr->stag);
+
+	if (iwpbl->pbl_allocated)
+		irdma_free_pble(iwdev->rf->pble_rsrc, &iwpbl->pble_alloc);
+
+	kfree(iwmr);
+	return 0;
+}
+
+/**
  * irdma_dereg_mr - deregister mr
  * @ib_mr: mr ptr for dereg
  * @udata: user data
@@ -3910,6 +3976,9 @@ static int irdma_dereg_mr(struct ib_mr *ib_mr, struct ib_udata *udata)
 	struct irdma_device *iwdev = to_iwdev(ib_mr->device);
 	struct irdma_pbl *iwpbl = &iwmr->iwpbl;
 	int ret;
+
+	if (iwmr->region && iwmr->region->is_dmabuf)
+		return irdma_dereg_mr_dmabuf(iwdev, iwmr);
 
 	if (iwmr->type != IRDMA_MEMREG_TYPE_MEM) {
 		if (iwmr->region) {
